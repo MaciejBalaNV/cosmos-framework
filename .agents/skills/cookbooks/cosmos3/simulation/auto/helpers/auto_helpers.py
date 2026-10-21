@@ -443,11 +443,14 @@ def submit_joint(client, form: dict, paths: list[Path], output_dir: Path, *, tim
 
 
 def download_lidar(client, job: dict, output_path: Path) -> tuple[Path, dict]:
-    """Stream a completed job's numeric LiDAR and save its descriptor beside it as JSON."""
+    """Stream numeric LiDAR from the completed job's descriptor URL and save its descriptor as JSON."""
     if job.get("status") != "completed" or not job.get("lidar"):
         raise RuntimeError("The job must be completed and describe a LiDAR artifact; see job.json.")
+    url = job["lidar"].get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise RuntimeError("The completed job must provide a nonempty LiDAR artifact URL; see job.json.")
     output_path = Path(output_path)
-    _download(client, f"/v1/videos/{job['id']}/lidar", output_path)
+    _download(client, url, output_path)
     output_path.with_suffix(".json").write_text(json.dumps(job["lidar"], indent=2) + "\n")
     return output_path, job["lidar"]
 

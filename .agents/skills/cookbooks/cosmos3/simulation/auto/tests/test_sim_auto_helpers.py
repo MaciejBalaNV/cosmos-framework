@@ -1,15 +1,15 @@
 """CPU regressions for the seven-camera Sim-Auto cookbook requests and HTTP client."""
 
-import copy
 import contextlib
+import copy
 import io
 import json
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -22,7 +22,11 @@ sys.path.insert(0, str(AUTO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from helpers.sim_auto_vllm_omni_helpers import (
-    CAMERA_ORDER, MODEL_ID, load_request, prepare_request, require_inputs,
+    CAMERA_ORDER,
+    MODEL_ID,
+    load_request,
+    prepare_request,
+    require_inputs,
 )
 from test_daytime_sample import make_sample, mock_convert
 
@@ -189,10 +193,11 @@ class SimAutoNotebookTests(SimAutoFixture, unittest.TestCase):
         original_client = httpx.Client
         fail = False
         requests = []
+        lidar_descriptor = {"url": "/v1/videos/video-1/content?variant=lidar", "fps": 10.0}
 
         def handler(request):
             path = request.url.path
-            requests.append((request.method, path))
+            requests.append((request.method, request.url))
             if path == "/v1/models":
                 return httpx.Response(200, json={"data": [{"id": MODEL_ID}]})
             if path == "/v1/videos/sync":
@@ -205,11 +210,12 @@ class SimAutoNotebookTests(SimAutoFixture, unittest.TestCase):
                 body = request.read()
                 self.assertEqual(body.count(b'name="input_references"'), 15)
                 self.assertIn(b'filename="lidar_control.safetensors"', body)
-                return httpx.Response(200, json={"id": "video-1", "status": "completed", "lidar": {"fps": 10.0}})
+                return httpx.Response(200, json={"id": "video-1", "status": "completed", "lidar": lidar_descriptor})
             if path == "/v1/videos/video-1/content":
+                if request.url.params.get("variant") == "lidar":
+                    return httpx.Response(200, content=b"mock lidar")
+                self.assertNotIn("variant", request.url.params)
                 return httpx.Response(200, content=b"mock joint video")
-            if path == "/v1/videos/video-1/lidar":
-                return httpx.Response(200, content=b"mock lidar")
             raise AssertionError(f"Unexpected request {request.method} {path}")
 
         def client_factory(*args, **kwargs):
@@ -274,13 +280,19 @@ class SimAutoNotebookTests(SimAutoFixture, unittest.TestCase):
             joint, = json.loads((joint_dir / "sample_outputs.json").read_text())
             self.assertEqual((joint["status"], joint["job_id"], len(joint["cameras"])), ("success", "video-1", 7))
             self.assertEqual((joint_dir / "multiview_camera_major.lidar.safetensors").read_bytes(), b"mock lidar")
-            self.assertEqual(json.loads((joint_dir / "multiview_camera_major.lidar.json").read_text()), {"fps": 10.0})
+            self.assertEqual(json.loads((joint_dir / "multiview_camera_major.lidar.json").read_text()), lidar_descriptor)
             validate_lidar.assert_called_once()
             self.assertEqual(validate_lidar.call_args.args[1], 99)
             self.assertEqual(validate_output.call_args.args[2], 99)
             joint_extra = json.loads(json.loads((joint_dir / "request.json").read_text())["extra_params"])
             self.assertEqual(joint_extra["lidar"], {"control_reference_index": 14, "return_output": True})
-            self.assertIn(("POST", "/v1/videos"), requests)
+            self.assertIn(("POST", httpx.URL("http://test/v1/videos")), requests)
+
+            requests.clear()
+            scope["lidar_output"].unlink()
+            exec(cells["sim-auto-joint-download"], scope)
+            self.assertEqual(requests, [("GET", httpx.URL("http://test" + lidar_descriptor["url"]))])
+            self.assertEqual(scope["lidar_output"].read_bytes(), b"mock lidar")
 
             first_session = json.loads(json.loads((sample_dir / "request.json").read_text())["extra_params"])["session_id"]
             exec(cells["sim-auto-16"], scope)

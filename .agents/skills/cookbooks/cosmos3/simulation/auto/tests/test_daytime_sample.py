@@ -4,19 +4,20 @@ import copy
 import hashlib
 import io
 import json
-from pathlib import Path
 import sys
 import tarfile
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import numpy as np
 
 AUTO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(AUTO_ROOT))
 
-from helpers.auto_helpers import CAMERA_ORDER, prepare_request
+from helpers.auto_helpers import CAMERA_ORDER, download_lidar, prepare_request
 from helpers.daytime_sample import SAMPLE_CAMERAS, read_caption, resolve_request, sample_files, verify_sample
 from helpers.lidar_rangemap import convert_control, pool_nearest_return
 
@@ -250,6 +251,96 @@ class LidarRangemapTests(unittest.TestCase):
 
 
 
+class LidarDownloadTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.output = Path(temporary.name) / "output.lidar.safetensors"
+        self.descriptor = {"url": "/v1/videos/video-1/content?variant=lidar", "fps": 10.0}
+        self.job = {"id": "video-1", "status": "completed", "lidar": self.descriptor}
+
+    def test_download_follows_relative_absolute_and_legacy_descriptor_urls(self):
+        for url in (
+            "/v1/videos/video-1/content?variant=lidar",
+            "http://test/v1/videos/video-1/content?variant=lidar",
+            "/v1/videos/video-1/lidar",
+        ):
+            with self.subTest(url=url):
+                self.descriptor["url"] = url
+                requests = []
+
+                def handler(request):
+                    requests.append(request)
+                    self.assertEqual(request.method, "GET")
+                    self.assertEqual(request.url, httpx.URL("http://test").join(url))
+                    self.assertEqual(request.headers["Authorization"], "Bearer test-key")
+                    return httpx.Response(200, content=b"numeric lidar")
+
+                with httpx.Client(
+                    base_url="http://test",
+                    headers={"Authorization": "Bearer test-key"},
+                    transport=httpx.MockTransport(handler),
+                ) as client:
+                    result = download_lidar(client, self.job, self.output)
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(result, (self.output, self.descriptor))
+                self.assertEqual(self.output.read_bytes(), b"numeric lidar")
+                self.assertEqual(json.loads(self.output.with_suffix(".json").read_text()), self.descriptor)
+
+    def test_missing_or_invalid_url_rejects_before_download(self):
+        for fields in ({}, {"url": None}, {"url": ""}, {"url": "   "}, {"url": 123}):
+            with self.subTest(fields=fields):
+                self.job["lidar"] = {"fps": 10.0, **fields}
+                with httpx.Client(
+                    transport=httpx.MockTransport(lambda request: self.fail("Unexpected HTTP request"))
+                ) as client:
+                    with self.assertRaisesRegex(RuntimeError, "LiDAR artifact URL"):
+                        download_lidar(client, self.job, self.output)
+                self.assertFalse(self.output.exists())
+                self.assertFalse(self.output.with_suffix(".json").exists())
+
+    def test_unfinished_job_or_missing_artifact_rejects_before_download(self):
+        for job in (
+            *({**self.job, "status": status} for status in ("queued", "in_progress", "failed")),
+            {"id": "video-1", "status": "completed"},
+            {**self.job, "lidar": None},
+        ):
+            with self.subTest(job=job):
+                with httpx.Client(
+                    transport=httpx.MockTransport(lambda request: self.fail("Unexpected HTTP request"))
+                ) as client:
+                    with self.assertRaisesRegex(RuntimeError, "completed.*LiDAR artifact"):
+                        download_lidar(client, job, self.output)
+
+    def test_failed_download_preserves_artifacts_and_removes_partial_file(self):
+        class InterruptedStream(httpx.SyncByteStream):
+            def __iter__(self):
+                yield b"partial lidar"
+                raise httpx.ReadError("interrupted")
+
+        for failure, exception in (("http", httpx.HTTPStatusError), ("stream", httpx.ReadError), ("empty", ValueError)):
+            with self.subTest(failure=failure):
+                self.output.write_bytes(b"previous lidar")
+                sidecar = self.output.with_suffix(".json")
+                sidecar.write_text('{"previous": true}\n')
+
+                def handler(request):
+                    if failure == "http":
+                        return httpx.Response(404, text="LiDAR artifact missing")
+                    if failure == "stream":
+                        return httpx.Response(200, stream=InterruptedStream())
+                    return httpx.Response(200, content=b"")
+
+                with httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler)) as client:
+                    with self.assertRaises(exception):
+                        download_lidar(client, self.job, self.output)
+                self.assertEqual(self.output.read_bytes(), b"previous lidar")
+                self.assertEqual(json.loads(sidecar.read_text()), {"previous": True})
+                self.assertFalse(self.output.with_suffix(".safetensors.part").exists())
+                if failure == "http":
+                    self.assertEqual((self.output.parent / "response_error.txt").read_text(), "LiDAR artifact missing")
+
+
 class TransferNotebookTests(unittest.TestCase):
     # Cells that decode real safetensors LiDAR; the fixture's LiDAR file is a placeholder.
     SKIPPED = {"lidar-preview", "lidar-visualize", "lidar-video"}
@@ -257,13 +348,10 @@ class TransferNotebookTests(unittest.TestCase):
     def test_both_examples_run_against_a_mock_server(self):
         import contextlib
         import os
-        from unittest.mock import patch
 
-        import httpx
         import IPython.display
-        from PIL import Image as PILImage
-
         from helpers import auto_helpers
+        from PIL import Image as PILImage
 
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -284,9 +372,12 @@ class TransferNotebookTests(unittest.TestCase):
         self.assertTrue(self.SKIPPED <= cells.keys())
 
         original_client = httpx.Client
+        seen_requests = []
+        lidar_descriptor = {"url": "/v1/videos/video-1/content?variant=lidar", "fps": 10.0}
 
         def handler(request):
             path = request.url.path
+            seen_requests.append((request.method, request.url))
             if path == "/v1/models":
                 return httpx.Response(200, json={"data": [{"id": "nvidia/Cosmos3-Nano-Transfer-Auto"}]})
             if path == "/v1/videos/sync":
@@ -294,11 +385,12 @@ class TransferNotebookTests(unittest.TestCase):
                 return httpx.Response(200, content=b"mock video", headers={"content-type": "video/mp4"})
             if path == "/v1/videos" and request.method == "POST":
                 self.assertEqual(request.read().count(b'name="input_references"'), 15)
-                return httpx.Response(200, json={"id": "video-1", "status": "completed", "lidar": {"fps": 10.0}})
+                return httpx.Response(200, json={"id": "video-1", "status": "completed", "lidar": lidar_descriptor})
             if path == "/v1/videos/video-1/content":
+                if request.url.params.get("variant") == "lidar":
+                    return httpx.Response(200, content=b"mock lidar")
+                self.assertNotIn("variant", request.url.params)
                 return httpx.Response(200, content=b"mock joint video")
-            if path == "/v1/videos/video-1/lidar":
-                return httpx.Response(200, content=b"mock lidar")
             raise AssertionError(f"Unexpected request {request.method} {path}")
 
         def split(video, output, cameras, frames, fps):
@@ -343,11 +435,16 @@ class TransferNotebookTests(unittest.TestCase):
                         read_frame=lambda path, index: PILImage.new("RGB", (8, 8)),
                         video_row=lambda videos, **kwargs: "",
                     )
+            seen_requests.clear()
+            scope["lidar_output"].unlink()
+            exec(cells["lidar-download"], scope)
+            self.assertEqual(seen_requests, [("GET", httpx.URL("http://test" + lidar_descriptor["url"]))])
         output = root / "runs"
         for example in ("wsm", "lidar"):
             record, = json.loads((output / example / "sample_outputs.json").read_text())
             self.assertEqual((record["status"], len(record["cameras"]), record["frames_per_camera"]), ("success", 7, 201))
         self.assertEqual((output / "lidar" / "multiview_camera_major.lidar.safetensors").read_bytes(), b"mock lidar")
+        self.assertEqual(json.loads((output / "lidar" / "multiview_camera_major.lidar.json").read_text()), lidar_descriptor)
         self.assertEqual(validate_output.call_args.args[2], 67)
         extra = json.loads(json.loads((output / "lidar" / "request.json").read_text())["extra_params"])
         self.assertEqual(extra["lidar"], {"return_output": True, "control_reference_index": 14})
