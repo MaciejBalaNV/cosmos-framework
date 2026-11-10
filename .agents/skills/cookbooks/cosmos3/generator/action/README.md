@@ -1,7 +1,7 @@
 # Cosmos3 Generator Action
 
 For Edge/Nano/Super static FP8 checkpoints, see the [quantization cookbook](../../quantization/README.md)
-and the **Quantized Checkpoints** section in the vLLM-Omni notebooks.
+for checkpoint preparation. The Cosmos3.5 vLLM-Omni regression notebooks assume an already deployed model.
 
 Cosmos3-Nano action-generation supports three distinct tasks:
 
@@ -25,8 +25,7 @@ The rest of this doc shows how to run these modes on selected embodiments direct
   - [Quickstart](#quickstart-2)
   - [Notebook walkthrough](#tensorrt-llm-notebook-walkthrough)
 - [Run with vLLM-Omni](#run-with-vllm-omni)
-  - [Quickstart](#quickstart-3)
-  - [Notebook walkthrough](#vllm-omni-notebook-walkthrough)
+  - [Cosmos3.5 regression guide](./vllm_omni_regression.md)
 - [Run with TensorRT-Edge-LLM](#run-with-tensorrt-edge-llm)
 - [Post-Train for Cosmos3-Nano-Policy-DROID](#post-train-for-cosmos3-nano-policy-droid)
 
@@ -279,46 +278,32 @@ top-level action JSON used by vLLM-Omni.
 
 ## Run with vLLM-Omni
 
-### Quickstart
+The vLLM-Omni notebooks now test the Cosmos3.5 action changes against an existing
+endpoint. They use normalized 59D unified actions, sparse validity masks,
+training-compatible prompts and checkpoint-derived sampling schedules.
 
-Set up the environment and start the server:
-[vLLM-Omni setup](../../README.md#vllm-omni) (Docker recommended). From the
-cookbook root (`.agents/skills`), set `export COSMOS3_WORKDIR=$PWD` and
-`export COSMOS3_HOST_PORT=8001`, then run the Docker command from the env setup
-guide. Wait until this succeeds:
+Set `COSMOS3_VLLM_BASE_URL` (default `http://localhost:8001`), open a notebook
+from inside this framework checkout, install its client dependencies and run all
+cells:
 
-```bash
-curl http://localhost:8001/v1/models
-```
+- [`run_fd_with_vllm_omni.ipynb`](./run_fd_with_vllm_omni.ipynb): single/mixed-domain
+  forward dynamics, history/state rows, inferred frame count and invalid schemas.
+- [`run_id_with_vllm_omni.ipynb`](./run_id_with_vllm_omni.ipynb): inverse dynamics,
+  history, measured/predicted state, schedules, masks and prompts.
+- [`run_policy_with_vllm_omni.ipynb`](./run_policy_with_vllm_omni.ipynb): `wam`,
+  the deprecated `policy` alias and `policy_action_only` without future video.
 
-Forward-dynamics requests are multipart `POST`s to `/v1/videos` — a start image
-under `files={"input_reference": ...}` plus an `extra_params` payload carrying the
-action trajectory. The vLLM notebooks use these diffusion defaults for action
-generation (see [`run_fd_with_vllm_omni.ipynb`](./run_fd_with_vllm_omni.ipynb) and
-[`run_id_with_vllm_omni.ipynb`](./run_id_with_vllm_omni.ipynb)):
+Default fixtures are synthetic protocol probes using the canonical global-asinh
+metric-gripper profile; they are not trajectory-quality references. Outputs,
+request snapshots and assertion summaries go to unique run directories under
+`outputs/cosmos35_action_vllm/`. Recorded fixtures and aligned reference outputs
+can be supplied for checkpoint-specific validation.
 
-| Field | Value |
-| --- | --- |
-| `num_inference_steps` | `30` |
-| `guidance_scale` | `1.0` |
-| `flow_shift` | `10.0` |
-
-The notebooks build the full request body for AV, DROID, UMI and human hand-pose examples,
-including autoregressive chunked generation for the robotics examples. Policy
-inference uses async `POST /v1/videos` to retrieve a rollout video plus
-top-level `action` metadata.
-
-### VLLM-Omni Notebook Walkthrough
-
-The vLLM-Omni notebooks send requests through the OpenAI-compatible video API and
-write outputs under `outputs/cosmos3_action_vllm/`:
-
-- [`run_fd_with_vllm_omni.ipynb`](./run_fd_with_vllm_omni.ipynb) — forward dynamics for AV,
-  DROID, UMI, and human hand-pose examples.
-- [`run_id_with_vllm_omni.ipynb`](./run_id_with_vllm_omni.ipynb) — inverse dynamics,
-  predicting ego-motion trajectories from input AV videos.
-- [`run_policy_with_vllm_omni.ipynb`](./run_policy_with_vllm_omni.ipynb) — policy
-  inference for DROID through the async video API.
+See the [Cosmos3.5 regression guide](./vllm_omni_regression.md) for the commit
+coverage matrix, fixture/reference formats, configuration variables and focused
+backend checks for guarantees the HTTP API does not expose. These notebooks
+replace the older native-dimension Cosmos3 vLLM examples; deployment is outside
+their scope.
 
 ## Run with TensorRT-Edge-LLM
 
@@ -338,8 +323,7 @@ serving. Multimodal reasoning on the same Edge-LLM runtime is documented in
 ### Notebook walkthrough
 
 [`run_policy_with_trt_edge_llm.ipynb`](./run_policy_with_trt_edge_llm.ipynb)
-builds the same 640×540 DROID `concat_view` as the vLLM-Omni / SGLang policy
-notebooks (from `assets/droid_lerobot_example`), runs
+builds a 640×540 DROID `concat_view` from `assets/droid_lerobot_example`, runs
 `cosmos3_policy_inference` with `--viewPoint concat_view` and an 8-value
 `--state`, and writes `action.json` (`[batch, chunk, action_dimension]`).
 Optional `--steps` / `--seed` match the upstream VLA guide.
